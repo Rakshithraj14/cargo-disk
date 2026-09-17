@@ -1,0 +1,14 @@
+[package]
+name = "cargo-disk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Analyze disk usage of Cargo build artifacts"
+license = "MIT"
+repository = "https://github.com/Rakshithraj14/cargo-disk"
+readme = "README.md"
+keywords = ["cargo", "disk", "size", "target", "cleanup"]
+categories = ["command-line-utilities", "development-tools::cargo-plugins"]
+exclude = ["/.github"]
+
+[dependencies]
