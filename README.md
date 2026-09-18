@@ -2,6 +2,8 @@
 
 Find out where your `target/` directory went.
 
+Available on crates.io: [cargo-disk](https://crates.io/crates/cargo-disk)
+
 ```bash
 cargo install cargo-disk
 ```
