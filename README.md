@@ -13,6 +13,7 @@ cargo install cargo-disk
 ```bash
 cargo disk                      # this project
 cargo disk --all ~/code         # every Cargo project under a directory
+cargo disk deps                 # potentially unused and outdated dependencies
 cargo disk clean --incremental  # delete only the incremental caches
 ```
 
@@ -96,6 +97,41 @@ registry/              703.12 MB
 Total shared cache:    703.12 MB
 ```
 
+## Dependencies
+
+`cargo disk deps` looks for dependencies your code never mentions, shows how
+much of `target/` each one would free, lists direct dependencies that have a
+newer version, and offers to remove the unused ones.
+
+On cargo-disk itself, which has no dependencies:
+
+```text
+$ cargo disk deps
+This project has no dependencies.
+```
+
+In a project with dependencies it prints:
+
+- **Potentially unused:** each dependency whose name never appears in the
+  project's `.rs` files as `name::`, `use name` or `extern crate name`,
+  numbered, with its kind (`dev`, `build`) and a `~` estimate of the space
+  freed if removed. That estimate counts every crate that only this dependency
+  pulls in, not just the crate itself.
+- **Outdated:** direct dependencies with a newer version, from
+  `cargo update --dry-run`, which never changes `Cargo.lock`. Shown only;
+  upgrading is left to you.
+- **`Remove which? (e.g. 1,2 / none)`**, on a terminal only. Your choice runs
+  `cargo remove`, then it tells you which files changed so you can undo with
+  `git checkout`.
+
+Text search cannot see a crate that is only linked (often `-sys`) or only
+enables a feature. List those in `Cargo.toml` so they are skipped:
+
+```toml
+[package.metadata.cargo-disk]
+ignore = ["openssl-sys"]
+```
+
 ## Cleaning
 
 `cargo clean` removes everything. This removes only the incremental caches,
@@ -133,8 +169,12 @@ Without `--dry-run` it lists the same directories and asks before deleting.
   convention as `du -h`, not allocated blocks.
 - `--all` skips hidden directories and `node_modules`, never descends into a
   `target/` it has found, and does not follow symlinks.
-- Honors `CARGO_TARGET_DIR`. Does not yet honor `build.target-dir` from
-  `.cargo/config.toml`.
+- The report, `clean` and `deps` ask Cargo where it builds, so
+  `CARGO_TARGET_DIR`, `build.target-dir` and `build.build-dir` are all
+  honored. With a separate build-dir, both directories are reported. `--all`
+  still looks only for folders named `target/`.
+- The report never uses the network. `deps` does, to check crates.io for newer
+  versions.
 
 ## License
 

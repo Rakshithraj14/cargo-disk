@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- `cargo disk deps` lists potentially unused dependencies with the space each
+  would free, and direct dependencies that have a newer version. On a terminal
+  it offers to remove the unused ones with `cargo remove`.
+- `[package.metadata.cargo-disk] ignore = [...]` skips dependencies that text
+  search cannot see being used.
+- The target directory now comes from Cargo, so `build.target-dir` and
+  `build.build-dir` in `.cargo/config.toml` are honored by the report, `clean`
+  and `deps`. A separate build-dir is reported alongside target-dir.
+
 ## 0.2.0
 
 - `cargo disk --all <dir>` ranks every Cargo project under a directory by
