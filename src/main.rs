@@ -1,3 +1,8 @@
+mod deps;
+mod json;
+mod metadata;
+
+use metadata::{Metadata, Mode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -24,6 +29,7 @@ const USAGE: &str = "\
 usage:
   cargo disk                      disk usage of the current project
   cargo disk --all <dir>          every Cargo project under <dir>
+  cargo disk deps                 potentially unused and outdated dependencies
   cargo disk clean --incremental  delete incremental caches
                                   [--dry-run] [--yes]
   cargo disk --help | --version";
@@ -33,6 +39,7 @@ enum Cmd {
     Report,
     All(PathBuf),
     Clean { dry_run: bool, yes: bool },
+    Deps,
     Help,
     Version,
 }
@@ -62,6 +69,10 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             Some(dir) if rest.next().is_none() => Ok(Cmd::All(PathBuf::from(dir))),
             Some(_) => Err("--all takes one directory".into()),
             None => Err("--all needs a directory, e.g. `cargo disk --all ~/code`".into()),
+        },
+        Some("deps") => match rest.next() {
+            None => Ok(Cmd::Deps),
+            Some(other) => Err(format!("unknown flag for deps: {other}")),
         },
         Some("clean") => {
             let (mut incremental, mut dry_run, mut yes) = (false, false, false);
@@ -107,19 +118,22 @@ fn run(cmd: Cmd) -> i32 {
                 1
             }
         },
-        Cmd::Report | Cmd::Clean { .. } => {
+        Cmd::Report | Cmd::Clean { .. } | Cmd::Deps => {
             let Some(manifest) = locate_project() else {
                 eprintln!("cargo-disk: not inside a Cargo project");
                 return 1;
             };
             let root = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let target = std::env::var_os("CARGO_TARGET_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root.join("target"));
             match cmd {
-                Cmd::Clean { dry_run, yes } => clean_incremental(&target, dry_run, yes),
+                Cmd::Deps => deps::run(&root),
+                Cmd::Clean { dry_run, yes } => {
+                    clean_incremental(&output_dirs(&root, None), dry_run, yes)
+                }
                 _ => {
-                    emit(&report(&manifest, &root, &target));
+                    // Offline: a disk report must never touch the network.
+                    let full = metadata::load(&root, Mode::Offline).ok();
+                    let dirs = output_dirs(&root, full.as_ref());
+                    emit(&report(&manifest, &root, &dirs, full.as_ref()));
                     0
                 }
             }
@@ -131,11 +145,51 @@ fn emit(text: &str) {
     let _ = std::io::stdout().write_all(text.as_bytes());
 }
 
-fn report(manifest: &Path, root: &Path, target: &Path) -> String {
-    let target = target.to_path_buf();
+/// The directories Cargo writes to: target-dir, plus build-dir when it is
+/// set elsewhere. Asked of Cargo rather than guessed, so `build.target-dir`,
+/// `build.build-dir` and CARGO_TARGET_DIR are all honored.
+fn output_dirs(root: &Path, meta: Option<&Metadata>) -> Vec<PathBuf> {
+    let fallback;
+    let meta = match meta {
+        Some(meta) => Some(meta),
+        None => {
+            fallback = metadata::load(root, Mode::NoDeps).ok();
+            fallback.as_ref()
+        }
+    };
+    let (target, build) = match meta {
+        Some(m) => (m.target_dir.clone(), m.build_dir.clone()),
+        None => {
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join("target"));
+            (target.clone(), target)
+        }
+    };
+    if build.starts_with(&target) {
+        vec![target]
+    } else if target.starts_with(&build) {
+        vec![build]
+    } else {
+        vec![target, build]
+    }
+}
+
+/// `path` relative to whichever output directory holds it most closely.
+fn relative<'a>(path: &'a Path, dirs: &[PathBuf]) -> Option<&'a Path> {
+    dirs.iter()
+        .filter_map(|d| path.strip_prefix(d).ok())
+        .min_by_key(|rel| rel.components().count())
+}
+
+fn report(manifest: &Path, root: &Path, dirs: &[PathBuf], meta: Option<&Metadata>) -> String {
     let mut files = Vec::new();
-    walk(&target, &mut files, &mut HashSet::new());
-    let total: u64 = files.iter().map(|f| f.bytes).sum();
+    let mut seen = HashSet::new();
+    // build-dir first: target-dir's final binaries are hardlinks into it, and
+    // the first name walked keeps the bytes, so they stay under deps/.
+    for dir in dirs.iter().rev() {
+        walk(dir, &mut files, &mut seen);
+    }
 
     let out = &mut String::new();
     line(out, "Cargo Disk");
@@ -144,27 +198,51 @@ fn report(manifest: &Path, root: &Path, target: &Path) -> String {
     line(out, &format!("Project: {}", project_name(manifest, root)));
     line(out, "");
 
+    let titled: Vec<(&PathBuf, &str, &str)> = dirs
+        .iter()
+        .zip([("TARGET/", ""), ("BUILD-DIR/", " (build-dir)")])
+        .map(|(d, (title, tag))| (d, title, tag))
+        .collect();
+    let sizes: Vec<u64> = dirs
+        .iter()
+        .map(|d| {
+            files
+                .iter()
+                .filter(|f| f.path.starts_with(d))
+                .map(|f| f.bytes)
+                .sum()
+        })
+        .collect();
+
     line(out, "Total disk usage");
-    row(out, &format!("  {}/", dir_label(&target)), total);
+    for ((dir, _, tag), bytes) in titled.iter().zip(&sizes) {
+        row(out, &format!("  {}/{tag}", dir_label(dir)), *bytes);
+    }
     if let Ok(meta) = fs::metadata(root.join("Cargo.lock")) {
         row(out, "  Cargo.lock", meta.len());
     }
 
-    let top = breakdown(&files, &target);
-    section(out, "TARGET/", &top);
-
-    if let Some((label, _)) = top.first().filter(|(l, _)| l.ends_with('/')) {
+    let mut largest_profile: Option<(PathBuf, String, u64)> = None;
+    for (dir, title, _) in &titled {
+        let top = breakdown(&files, dir);
+        section(out, title, &top);
+        if let Some((label, bytes)) = top.iter().find(|(l, _)| l.ends_with('/')) {
+            if largest_profile.as_ref().is_none_or(|(_, _, b)| bytes > b) {
+                largest_profile = Some((dir.to_path_buf(), label.clone(), *bytes));
+            }
+        }
+    }
+    if let Some((dir, label, _)) = largest_profile {
         let profile = label.trim_end_matches('/');
-        let dir = target.join(profile);
         section(
             out,
             &format!("{}/", profile.to_uppercase()),
-            &breakdown(&files, &dir),
+            &breakdown(&files, &dir.join(profile)),
         );
     }
 
     let crates = group(&files, |f| {
-        let rel = f.path.strip_prefix(&target).ok()?;
+        let rel = relative(&f.path, dirs)?;
         Some(crate_name(rel).unwrap_or_else(|| "(other)".to_string()))
     });
     if !crates.is_empty() {
@@ -177,10 +255,11 @@ fn report(manifest: &Path, root: &Path, target: &Path) -> String {
         }
     }
 
-    if let Some(locked) = known_crates(root) {
+    if let Some(meta) = meta {
+        let known = known_crates(root, meta);
         let orphans: Vec<(String, u64)> = crates
             .iter()
-            .filter(|(name, _)| is_orphan(name, &locked))
+            .filter(|(name, _)| is_orphan(name, &known))
             .cloned()
             .collect();
         if !orphans.is_empty() {
@@ -196,7 +275,7 @@ fn report(manifest: &Path, root: &Path, target: &Path) -> String {
         }
     }
 
-    let builds = build_counts(&files, &target);
+    let builds = build_counts(&files, dirs);
     if !builds.is_empty() {
         line(out, "");
         line(out, "Builds per crate");
@@ -210,7 +289,7 @@ fn report(manifest: &Path, root: &Path, target: &Path) -> String {
         }
     }
 
-    let (incremental, old) = cleanup_buckets(&files, &target, SystemTime::now());
+    let (incremental, old) = cleanup_buckets(&files, dirs, SystemTime::now());
     line(out, "");
     line(out, "Potential cleanup");
     line(out, RULE);
@@ -357,10 +436,10 @@ fn artifact_stem(file: &str) -> Option<&str> {
     (!stem.is_empty()).then_some(stem)
 }
 
-fn cleanup_buckets(files: &[Entry], base: &Path, now: SystemTime) -> (u64, u64) {
+fn cleanup_buckets(files: &[Entry], dirs: &[PathBuf], now: SystemTime) -> (u64, u64) {
     let (mut incremental, mut old) = (0, 0);
     for f in files {
-        let Ok(rel) = f.path.strip_prefix(base) else {
+        let Some(rel) = relative(&f.path, dirs) else {
             continue;
         };
         if rel.components().any(|c| c.as_os_str() == "incremental") {
@@ -374,10 +453,10 @@ fn cleanup_buckets(files: &[Entry], base: &Path, now: SystemTime) -> (u64, u64) 
 
 // Cargo.lock alone is not enough: it lists package names, while target/ is named
 // after lib targets, and the two differ (md-5 builds md5, rustls-webpki builds
-// webpki). Metadata carries both, so it is required — without it there is no
-// orphan section rather than a wrong one.
-fn known_crates(root: &Path) -> Option<HashSet<String>> {
-    let mut names = metadata_names(root)?;
+// webpki). Full metadata carries both, so the orphan section requires it —
+// without it there is no section rather than a wrong one.
+fn known_crates(root: &Path, meta: &Metadata) -> HashSet<String> {
+    let mut names: HashSet<String> = meta.artifact_names().collect();
     if let Ok(lock) = fs::read_to_string(root.join("Cargo.lock")) {
         names.extend(
             lock.lines()
@@ -385,38 +464,17 @@ fn known_crates(root: &Path) -> Option<HashSet<String>> {
                 .map(|v| v.trim().trim_matches('"').replace('-', "_")),
         );
     }
-    Some(names)
-}
-
-fn metadata_names(root: &Path) -> Option<HashSet<String>> {
-    let out = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--frozen"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let names: HashSet<String> = text
-        .match_indices("\"name\":\"")
-        .filter_map(|(at, pat)| {
-            let start = at + pat.len();
-            let end = start + text[start..].find('"')?;
-            Some(text[start..end].replace('-', "_"))
-        })
-        .collect();
-    (!names.is_empty()).then_some(names)
+    names
 }
 
 fn is_orphan(name: &str, known: &HashSet<String>) -> bool {
     !known.contains(name) && !matches!(name, "(other)" | "build_script_build" | "build_script_main")
 }
 
-fn build_counts(files: &[Entry], base: &Path) -> Vec<(String, usize)> {
+fn build_counts(files: &[Entry], dirs: &[PathBuf]) -> Vec<(String, usize)> {
     let mut units: HashMap<String, HashSet<String>> = HashMap::new();
     for f in files {
-        let Ok(rel) = f.path.strip_prefix(base) else {
+        let Some(rel) = relative(&f.path, dirs) else {
             continue;
         };
         let comps: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
@@ -580,28 +638,33 @@ fn ago(then: SystemTime, now: SystemTime) -> String {
     format!("{n} {unit}{} ago", plural(n as usize))
 }
 
-fn clean_incremental(target: &Path, dry_run: bool, yes: bool) -> i32 {
-    let Ok(target) = target.canonicalize() else {
+fn clean_incremental(outputs: &[PathBuf], dry_run: bool, yes: bool) -> i32 {
+    let outputs: Vec<PathBuf> = outputs
+        .iter()
+        .filter_map(|d| d.canonicalize().ok())
+        .collect();
+    if outputs.is_empty() {
         eprintln!("cargo-disk: nothing built yet — no target directory");
         return 1;
-    };
-    let dirs: Vec<(PathBuf, u64)> = incremental_dirs(&target)
-        .into_iter()
-        .map(|dir| {
+    }
+    let mut dirs: Vec<(PathBuf, u64, &PathBuf)> = Vec::new();
+    for output in &outputs {
+        for dir in incremental_dirs(output) {
             let mut files = Vec::new();
             walk(&dir, &mut files, &mut HashSet::new());
             let bytes = files.iter().map(|f| f.bytes).sum();
-            (dir, bytes)
-        })
-        .filter(|(_, bytes)| *bytes > 0)
-        .collect();
+            if bytes > 0 && !dirs.iter().any(|(d, _, _)| *d == dir) {
+                dirs.push((dir, bytes, output));
+            }
+        }
+    }
     if dirs.is_empty() {
         println!("No incremental caches found.");
         return 0;
     }
 
-    let total: u64 = dirs.iter().map(|(_, b)| b).sum();
-    for (dir, bytes) in &dirs {
+    let total: u64 = dirs.iter().map(|(_, b, _)| b).sum();
+    for (dir, bytes, _) in &dirs {
         println!("{:<9}  {}", format_size(*bytes), dir.display());
     }
     if dry_run {
@@ -614,8 +677,8 @@ fn clean_incremental(target: &Path, dry_run: bool, yes: bool) -> i32 {
     }
 
     let (mut freed, mut failed) = (0, 0);
-    for (dir, bytes) in &dirs {
-        if !removable(dir, &target) {
+    for (dir, bytes, output) in &dirs {
+        if !removable(dir, output) {
             eprintln!(
                 "cargo-disk: skipped {} — changed since listing",
                 dir.display()
@@ -782,7 +845,7 @@ mod tests {
                 now.duration_since(SystemTime::UNIX_EPOCH).unwrap(),
             ),
         ];
-        let (incremental, old) = cleanup_buckets(&files, Path::new("/t"), now);
+        let (incremental, old) = cleanup_buckets(&files, &[PathBuf::from("/t")], now);
         assert_eq!((incremental, old), (100, 20));
     }
 
@@ -882,15 +945,41 @@ mod tests {
     }
 
     #[test]
-    fn no_metadata_means_no_orphan_section() {
-        let dir = std::env::temp_dir().join("cargo-disk-nolock-test");
+    fn lib_names_count_as_known_not_just_package_names() {
+        let dir = std::env::temp_dir().join("cargo-disk-known-test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // A lockfile alone must not be enough: package names there do not match
-        // lib names in target/ (md-5 builds md5), so orphans would be invented.
-        fs::write(dir.join("Cargo.lock"), "[[package]]\nname = \"serde\"\n").unwrap();
-        assert_eq!(known_crates(&dir), None);
+        // The lockfile only says md-5; target/ says md5. On a freshly built
+        // clob-rs this invented three orphans (md5, webpki, utf8).
+        fs::write(dir.join("Cargo.lock"), "[[package]]\nname = \"md-5\"\n").unwrap();
+        let meta = metadata::from_json(
+            &json::parse(
+                r#"{"target_directory":"/t","packages":[{"id":"m","name":"md-5",
+                "manifest_path":"/m/Cargo.toml","dependencies":[],
+                "targets":[{"kind":["lib"],"name":"md5"}]}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let known = known_crates(&dir, &meta);
+        assert!(!is_orphan("md5", &known));
+        assert!(!is_orphan("md_5", &known));
+        assert!(is_orphan("regex", &known));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_are_relative_to_the_closest_output_dir() {
+        let dirs = [PathBuf::from("/p/out"), PathBuf::from("/p/out/bld")];
+        assert_eq!(
+            relative(Path::new("/p/out/bld/debug/deps/x"), &dirs),
+            Some(Path::new("debug/deps/x"))
+        );
+        assert_eq!(
+            relative(Path::new("/p/out/debug/app"), &dirs),
+            Some(Path::new("debug/app"))
+        );
+        assert_eq!(relative(Path::new("/elsewhere/x"), &dirs), None);
     }
 
     #[test]
@@ -904,7 +993,7 @@ mod tests {
         };
         let mut files = vec![unit("aaa"), unit("bbb"), unit("ccc")];
         assert!(
-            build_counts(&files, Path::new("/t")).is_empty(),
+            build_counts(&files, &[PathBuf::from("/t")]).is_empty(),
             "three units is normal: lib, test, check"
         );
         files.push(unit("ddd"));
@@ -914,7 +1003,7 @@ mod tests {
             Duration::from_secs(0),
         ));
         assert_eq!(
-            build_counts(&files, Path::new("/t")),
+            build_counts(&files, &[PathBuf::from("/t")]),
             vec![("cargo_disk".to_string(), 4)]
         );
     }
